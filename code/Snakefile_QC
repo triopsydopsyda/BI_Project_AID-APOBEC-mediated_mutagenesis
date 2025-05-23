@@ -1,0 +1,84 @@
+from pathlib import Path
+import re
+
+FASTQC_DIR = "FastQC_output"
+MULTIQC_DIR = "MultiQC_output"
+STATS_DIR = 'stats'
+
+fastq_files = list(Path("Genomes_hst3.4").rglob("hst3.4.*_L*_R*_001.fastq.gz"))
+
+pattern = re.compile(r"hst3.4\.(?P<sample>\d+)_L(?P<lane>\d+)_R(?P<read>\d)_001.fastq.gz")
+
+SAMPLES_LANES_READS = sorted(set(
+    (match.group("sample"), match.group("lane"), match.group("read"))
+    for file in fastq_files if (match := pattern.search(str(file)))
+))
+
+rule all:
+    input:
+        expand(f"{FASTQC_DIR}/hst3.4.{{sample}}_L{{lane}}_R{{read}}_001_fastqc.html",
+               sample=[s[0] for s in SAMPLES_LANES_READS],
+               lane=[s[1] for s in SAMPLES_LANES_READS],
+               read=[s[2] for s in SAMPLES_LANES_READS]),
+        f"{MULTIQC_DIR}/multiqc_report.html",
+        f"{STATS_DIR}/combined_seqkit_stats.txt"
+
+def get_fastq_file(wildcards):
+    """Функция для поиска файла, соответствующего `sample`, `lane`, `read`"""
+    search_pattern = f"hst3.4.{wildcards.sample}_L{wildcards.lane}_R{wildcards.read}_001.fastq.gz"
+    print(f"Ищу файлы с паттерном: {search_pattern}")
+    files = list(Path("Genomes_hst3.4").rglob(search_pattern))
+    print(f"Найдено файлов: {len(files)}")
+    if files:
+        return files[0]
+    else:
+        raise ValueError(f"Файл не найден для sample={wildcards.sample}, lane={wildcards.lane}, read={wildcards.read}")
+
+rule FastqC:
+    input:
+        get_fastq_file
+    output:
+        html = f"{FASTQC_DIR}/hst3.4.{{sample}}_L{{lane}}_R{{read}}_001_fastqc.html",
+        zip = f"{FASTQC_DIR}/hst3.4.{{sample}}_L{{lane}}_R{{read}}_001_fastqc.zip"
+    shell:
+        """
+        mkdir -p {FASTQC_DIR}
+        fastqc {input} -o {FASTQC_DIR} || (echo "Ошибка в fastqc для файла {input}" && exit 1)
+        """
+
+rule multiqC:
+    input:
+        expand(f"{FASTQC_DIR}/hst3.4.{{sample}}_L{{lane}}_R{{read}}_001_fastqc.html",
+               sample=[s[0] for s in SAMPLES_LANES_READS],
+               lane=[s[1] for s in SAMPLES_LANES_READS],
+               read=[s[2] for s in SAMPLES_LANES_READS])
+    output:
+        f"{MULTIQC_DIR}/multiqc_report.html"
+    shell:
+        """
+        mkdir -p {MULTIQC_DIR}
+        multiqc FastQC_output -o {MULTIQC_DIR}
+        """
+rule seqkit_stats:
+    input:
+        get_fastq_file
+    output:
+        stats_file = f"{STATS_DIR}/{{sample}}_L{{lane}}_R{{read}}_seqkit_stats.txt"
+    shell:
+        """
+        mkdir -p {STATS_DIR}
+        seqkit stats {input} > {output.stats_file}
+        """
+rule combine_seqkit_stats:
+    input:
+        expand(f"{STATS_DIR}/{{sample}}_L{{lane}}_R{{read}}_seqkit_stats.txt",
+               sample=[s[0] for s in SAMPLES_LANES_READS],
+               lane=[s[1] for s in SAMPLES_LANES_READS],
+               read=[s[2] for s in SAMPLES_LANES_READS])
+    output:
+        f"{STATS_DIR}/combined_seqkit_stats.txt"
+    shell:
+        """
+        mkdir -p {STATS_DIR}
+        cat {input} > {output}
+        """

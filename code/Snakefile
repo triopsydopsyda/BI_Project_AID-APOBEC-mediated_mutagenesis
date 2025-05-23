@@ -1,0 +1,260 @@
+import os
+
+REFERENCE = "/home/shipunova/test/GCF_000146045.2_R64_genomic.fna"
+
+LANES = ["1", "2"]
+
+SAFE_SAMPLE_MAP = {
+    "control": "control",
+    "hst3_4_3": "hst3.4.3",
+    "hst3_4_10": "hst3.4.10"
+}
+
+SAMPLES_ALL = list(SAFE_SAMPLE_MAP.keys())
+SAMPLES_L002 = [s for s in SAMPLES_ALL if s != "control"]
+
+rule all:
+    input:
+        expand("alignements/{sample}_L001.sam", sample=SAMPLES_ALL),
+        expand("alignements/{sample}_L002.sam", sample=SAMPLES_L002),
+        expand("sorted/{sample}_L001.bam", sample=SAMPLES_ALL),
+        expand("sorted/{sample}_L002.bam", sample=SAMPLES_L002),
+        expand("merged/{sample}_merged.bam", sample=SAMPLES_L002),
+        expand("dedup/{sample}_dedup.bam", sample=SAMPLES_ALL),
+        expand("stats/{sample}_wgs_metrics.txt", sample=SAMPLES_ALL),
+        expand("stats/{sample}_align_metrics.txt", sample=SAMPLES_ALL),
+        expand("stats/{sample}_validate.txt", sample=SAMPLES_ALL),
+        "results/all_samples_filt_PASS.vcf.gz",
+        "results/output.stats",
+        REFERENCE + ".fai",
+        REFERENCE.replace(".fna", ".dict")
+
+rule mkdirs:
+    run:
+        for d in ["sorted", "merged", "dedup", "stats", "gvcf", "vcf", "results", "alignements"]:
+            os.makedirs(d, exist_ok=True)
+
+rule bwa_mem:
+    input:
+        genome=REFERENCE,
+        r1=lambda wc: f"Genomes_hst3.4/Sample_{SAFE_SAMPLE_MAP[wc.sample]}/{SAFE_SAMPLE_MAP[wc.sample]}_L00{wc.lane}_R1_001.fastq.gz",
+        r2=lambda wc: f"Genomes_hst3.4/Sample_{SAFE_SAMPLE_MAP[wc.sample]}/{SAFE_SAMPLE_MAP[wc.sample]}_L00{wc.lane}_R2_001.fastq.gz"
+    output:
+        "alignements/{sample}_L00{lane}.sam"
+    params:
+        rg=lambda wc: f"@RG\\tID:{wc.sample}_L{wc.lane}\\tPL:ILLUMINA\\tPU:HCGKNBCXY.{wc.lane}\\tLB:{wc.sample}\\tSM:{wc.sample}"
+    shell:
+        """
+        bwa mem -t 10 -R "{params.rg}" {input.genome} {input.r1} {input.r2} > {output}
+        """
+
+rule sort_sam:
+    input:
+        "alignements/{sample}_L00{lane}.sam"
+    output:
+        "sorted/{sample}_L00{lane}.bam"
+    threads: 10
+    shell:
+        "samtools sort -@ {threads} -o {output} {input}"
+
+rule merge_bam:
+    input:
+        lambda wc: [f"sorted/{wc.sample}_L001.bam", f"sorted/{wc.sample}_L002.bam"] if wc.sample != "control" else [f"sorted/{wc.sample}_L001.bam"]
+    output:
+        "merged/{sample}_merged.bam"
+    threads: 10
+    shell:
+        "samtools merge -@ {threads} {output} {input}"
+
+rule mark_duplicates:
+    input:
+        "merged/{sample}_merged.bam"
+    output:
+        bam="dedup/{sample}_dedup.bam",
+        metrics="dedup/{sample}_dup_metrics.txt"
+    shell:
+        """
+        picard MarkDuplicates \\
+            I={input} \\
+            O={output.bam} \\
+            M={output.metrics} \\
+            REMOVE_DUPLICATES=false \\
+            CREATE_INDEX=true
+        """
+
+rule index_bam:
+    input:
+        "dedup/{sample}_dedup.bam"
+    output:
+        "dedup/{sample}_dedup.bam.bai"
+    shell:
+        "samtools index {input}"
+
+rule collect_wgs_metrics:
+    input:
+        bam="dedup/{sample}_dedup.bam",
+        bai="dedup/{sample}_dedup.bam.bai",
+        ref=REFERENCE
+    output:
+        "stats/{sample}_wgs_metrics.txt"
+    shell:
+        """
+        picard CollectWgsMetrics \\
+            I={input.bam} \\
+            O={output} \\
+            R={input.ref} \\
+            INCLUDE_BQ_HISTOGRAM=true
+        """
+
+rule collect_alignment_metrics:
+    input:
+        bam="dedup/{sample}_dedup.bam",
+        ref=REFERENCE
+    output:
+        "stats/{sample}_align_metrics.txt"
+    shell:
+        """
+        picard CollectAlignmentSummaryMetrics \\
+            R={input.ref} \\
+            I={input.bam} \\
+            O={output}
+        """
+
+rule validate_bam:
+    input:
+        "dedup/{sample}_dedup.bam"
+    output:
+        "stats/{sample}_validate.txt"
+    shell:
+        """
+        picard ValidateSamFile \\
+            I={input} \\
+            MODE=SUMMARY > {output} 2>&1
+        """
+
+rule index_fasta:
+    input:
+        ref=REFERENCE
+    output:
+        ref_fai=REFERENCE + ".fai"
+    shell:
+        "samtools faidx {input.ref}"
+
+rule create_dict:
+    input:
+        REFERENCE
+    output:
+        REFERENCE.replace(".fna", ".dict")
+    shell:
+        "picard CreateSequenceDictionary R={input} O={output}"
+
+rule haplotype_caller:
+    input:
+        bam="dedup/{sample}_dedup.bam",
+        ref=REFERENCE,
+        ref_fai=REFERENCE + ".fai",
+        ref_dict=REFERENCE.replace(".fna", ".dict")
+    output:
+        "gvcf/{sample}.g.vcf.gz"
+    params:
+        index="--create-output-variant-index"
+    shell:
+        "gatk HaplotypeCaller -I {input.bam} -O {output} -R {input.ref} -ploidy 1 -ERC GVCF {params.index}"
+
+rule combine_gvcfs:
+    input:
+        ref=REFERENCE,
+        vcfs=expand("gvcf/{sample}.g.vcf.gz", sample=SAMPLES_ALL)
+    output:
+        "gvcf/all_samples.g.vcf.gz"
+    params:
+        vcf_args=lambda wc, input: " ".join(f"--variant {vcf}" for vcf in input.vcfs)
+    shell:
+        "gatk CombineGVCFs -R {input.ref} {params.vcf_args} -O {output}"
+
+rule genotype_gvcfs:
+    input:
+        vcf="gvcf/all_samples.g.vcf.gz",
+        ref=REFERENCE
+    output:
+        "vcf/all_samples.vcf.gz"
+    shell:
+        "gatk GenotypeGVCFs -R {input.ref} -V {input.vcf} -O {output} -ploidy 1"
+
+rule select_snps:
+    input:
+        "vcf/all_samples.vcf.gz"
+    output:
+        "vcf/snps.vcf.gz"
+    shell:
+        "gatk SelectVariants -V {input} -select-type SNP -O {output}"
+
+rule select_indels:
+    input:
+        "vcf/all_samples.vcf.gz"
+    output:
+        "vcf/indels.vcf.gz"
+    shell:
+        "gatk SelectVariants -V {input} -select-type INDEL -O {output}"
+
+rule filter_snps:
+    input:
+        "vcf/snps.vcf.gz"
+    output:
+        "vcf/snps_HFDP10.vcf.gz"
+    shell:
+        """
+        gatk VariantFiltration \\
+            -V {input} \\
+            -filter "DP < 10.0" --filter-name "DP10" \\
+            -filter "QD < 2.0" --filter-name "QD2" \\
+            -filter "QUAL < 30.0" --filter-name "QUAL30" \\
+            -filter "SOR > 3.0" --filter-name "SOR3" \\
+            -filter "FS > 60.0" --filter-name "FS60" \\
+            -filter "MQ < 40.0" --filter-name "MQ40" \\
+            -filter "MQRankSum < -12.5" --filter-name "MQRankSum-12.5" \\
+            -filter "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum-8" \\
+            -O {output}
+        """
+
+rule filter_indels:
+    input:
+        "vcf/indels.vcf.gz"
+    output:
+        "vcf/indels_HFDP10.vcf.gz"
+    shell:
+        """
+        gatk VariantFiltration \\
+            -V {input} \\
+            -filter "DP < 10.0" --filter-name "DP10" \\
+            -filter "QD < 2.0" --filter-name "QD2" \\
+            -filter "QUAL < 30.0" --filter-name "QUAL30" \\
+            -filter "FS > 200.0" --filter-name "FS200" \\
+            -filter "ReadPosRankSum < -20.0" --filter-name "ReadPosRankSum-20" \\
+            -O {output}
+        """
+
+rule merge_vcfs:
+    input:
+        "vcf/snps_HFDP10.vcf.gz",
+        "vcf/indels_HFDP10.vcf.gz"
+    output:
+        "results/all_samples_filt.vcf"
+    shell:
+        "gatk MergeVcfs -I {input[0]} -I {input[1]} -O {output}"
+
+rule filter_pass:
+    input:
+        "results/all_samples_filt.vcf"
+    output:
+        "results/all_samples_filt_PASS.vcf.gz"
+    shell:
+        "bcftools view -f PASS {input} -Oz -o {output}"
+
+rule stats:
+    input:
+        "results/all_samples_filt_PASS.vcf.gz"
+    output:
+        "results/output.stats"
+    shell:
+        "bcftools stats -s - {input} > {output}"
